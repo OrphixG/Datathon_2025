@@ -225,3 +225,15 @@ recon_fc = fit %>%
 
 ### Diagnostics
 
+```{r}
+recon_tibble = recon_fc %>% as_tibble()
+
+first_month = recon_tibble %>% 
+  summarise(m1 = min(month)) %>% 
+  pull(m1)
+
+total_m1 = recon_tibble %>% 
+  filter(month == first_month, is_aggregated(state), is_aggregated(cargo)) %>%
+  select(.model, total = .mean)
+```
+
