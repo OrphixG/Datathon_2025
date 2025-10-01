@@ -33,11 +33,20 @@ library(janitor)
 library(rnaturalearth)
 library(rnaturalearthdata)
 
-data = read_csv("dynamic_supply_chain_logistics_dataset.csv") %>% 
-  rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude)
+data = read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
+  rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude) %>%
+  mutate(
+    lon = suppressWarnings(as.numeric(lon)),
+    lat = suppressWarnings(as.numeric(lat)),
+    timestamp = lubridate::ymd_hms(timestamp, quiet = TRUE),
+    delay_hours = pmax(suppressWarnings(as.numeric(delivery_time_deviation)), 0)
+  ) %>%
+  filter(!is.na(lon), !is.na(lat), !is.na(timestamp))
 ```
 
 # Visualisations
+
+We provide delay probabilities overlaid on the US map, and a subset of it on the SoCal region.
 
 ```{r}
 # Base map
@@ -141,4 +150,78 @@ For reconciliation, we should use an **additive** target variable. Thus, we defi
 ```{r}
 data = data %>% mutate(delay_time = pmax(delivery_time_deviation, 0))
 ```
+
+We also add a `State` variable for the two-level hierarchy on `State/cell_id`.
+
+```{r}
+# 1) Make fields numeric + additive ingredient (row-level)
+data = data %>%
+  mutate(
+    lon = suppressWarnings(as.numeric(lon)),
+    lat = suppressWarnings(as.numeric(lat)),
+    timestamp = ymd_hms(timestamp, quiet = TRUE),
+    delay_hours = pmax(as.numeric(delivery_time_deviation), 0)
+  ) %>%
+  filter(!is.na(lon), !is.na(lat), !is.na(timestamp))
+
+# 2) Attach US state (for two-level hierarchy: TOTAL → state → cell_id)
+us = ne_states(country = "United States of America", returnclass = "sf")
+us_conus = subset(us, !name %in% c("Alaska","Hawaii","Puerto Rico")) %>% st_transform(4326)
+
+pts = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+data = st_join(pts, us_conus["name"], left = TRUE) %>% st_drop_geometry()
+names(data)[names(data) == "name"] = "state"
+data = filter(data, !is.na(state))
+```
+
+# Forecast
+
+We first generate the *hierarchical* time series data associated with `data`. We group the data by months as well to get better totals; we tried hourly (default) and daily but don't get any good results.
+
+```{r}
+data_ts = data %>% mutate(month = yearmonth(timestamp),
+                       cargo = if_else(cargo_condition_status <= 0.5, "Poor", "Good")) %>%
+  arrange(month, state, cargo, timestamp) %>%
+  distinct(month, state, cargo, .keep_all = TRUE)
+
+ts = data_ts %>% as_tsibble(key = c(state, cargo), index = month) %>%
+  aggregate_key(state/cargo, delay_hours = sum(delay_hours))
+```
+
+## Train-Test Split
+
+```{r}
+n_test = 3  # last 3 months
+cutoff = max(ts$month, na.rm = TRUE) - n_test
+
+train_data = ts %>% filter(month <= cutoff)
+test_data  = ts %>% filter(month >  cutoff)
+```
+
+When we try to fit an ETS model, we generally get NULL models for a lot of these entries, so we counteract this by doing the specified ETS model for the non-NULL models, and set the rest as a TSLM model.
+
+- ETS (additive) captures level/trend/season for non-negative flows and adapts well when there’s actual signal.
+- TSLM(~1) (intercept-only) is a safe fallback for all-zero or ultra-sparse series; it yields a valid (typically zero) forecast instead of a <NULL model>, keeping the hierarchy intact for reconciliation.
+
+```{r}
+# Fallback if null
+fb = train_data %>% model(model = TSLM(delay_hours ~ 1))
+
+# main fitting
+fit = train_data %>% model(model = ETS(delay_hours ~ error("A")))
+is_null = is_null_model(fit$model)
+fit$model[is_null] = fb$model[is_null]
+```
+
+## Reconciliation
+
+```{r}
+recon_fc = fit %>%
+  reconcile(BU = bottom_up(model), 
+            OLS = min_trace(model, "ols"), 
+            WLS = min_trace(model, "wls_struct")) %>% 
+  forecast(h = n_test)
+```
+
+### Diagnostics
 
