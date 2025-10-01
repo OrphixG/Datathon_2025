@@ -176,25 +176,6 @@ names(data)[names(data) == "name"] = "state"
 data = filter(data, !is.na(state))
 ```
 
-## EDA: Delay Time vs Cargo Condition Status
-
-```{r}
-data = data %>% mutate(cargo = 
-                         if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good"))
-ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
-  geom_boxplot(outlier.alpha = 0.15, width = 0.65) +
-  labs(title = "Delay time by cargo condition",
-       x = NULL, y = "Delay time (hours)") +
-  theme_bw()
-
-ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
-  geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
-  scale_fill_viridis_d(guide = "none") +
-  labs(title = "Distribution of delay time by cargo condition",
-       x = "Delay time (hours)", y = NULL) +
-  theme_bw()
-```
-
 # Forecast
 
 We first generate the *hierarchical* time series data associated with `data`. We group the data by months as well to get better totals; we tried hourly (default) and daily but don't get any good results.
@@ -331,3 +312,23 @@ autoplot(recon_ca, level = NULL) +
 ```
 
 Overall seems like even with reconciliation, we don't get a more accurate model. This could be attributed to the input variable not being very "significant" in difference.
+
+## Post-Prediction EDA: Delay Time vs Cargo Condition Status
+
+```{r}
+data = data %>% mutate(cargo = 
+                         if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good"))
+ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.65) +
+  labs(title = "Delay time by cargo condition",
+       x = NULL, y = "Delay time (hours)") +
+  theme_bw()
+
+ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
+  scale_fill_viridis_d(guide = "none") +
+  labs(title = "Distribution of delay time by cargo condition",
+       x = "Delay time (hours)", y = NULL) +
+  theme_bw()
+```
+
