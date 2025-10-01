@@ -35,6 +35,7 @@ library(rnaturalearthdata)
 library(ggridges)
 library(knitr)
 library(forecast)
+library(patchwork)
 
 data = read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
   rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude) %>%
@@ -303,13 +304,15 @@ ca_hist = ts_m %>%
 recon_ca = recon_fc %>%
   filter(state == "California", is_aggregated(cargo))
 
-autoplot(recon_ca, level = NULL) +
+p1 = autoplot(recon_ca, level = NULL) +
   autolayer(ca_hist, total_delay_hours, alpha = 0.3) +
   labs(
     title = "Reconciled forecasts by method – California (state total)",
     y = "Total delay-hours (monthly)"
   ) +
   theme_bw()
+
+p1
 ```
 
 Overall seems like even with reconciliation, we don't get a more accurate model. This could be attributed to the input variable not being very "significant" in difference.
@@ -319,17 +322,20 @@ Overall seems like even with reconciliation, we don't get a more accurate model.
 ```{r}
 data = data %>% mutate(cargo = 
                          if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good"))
-ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
+p2 = ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
   geom_boxplot(outlier.alpha = 0.15, width = 0.65) +
   labs(title = "Delay time by cargo condition",
        x = NULL, y = "Delay time (hours)") +
   theme_bw()
 
-ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
+p3 = ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
   geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
   labs(title = "Distribution of delay time by cargo condition",
        x = "Delay time (hours)", y = NULL) +
   theme_bw()
+
+p_eda = p2 + p3
+p_eda
 ```
 
 So really not much of a difference overall; this is not a very relevant feature at least.
