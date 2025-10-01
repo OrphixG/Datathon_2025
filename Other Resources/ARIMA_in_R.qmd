@@ -92,3 +92,5 @@ autoplot(fc) +
        x = "Time", y = NULL) + theme_linedraw()
 ```
 
+
+
