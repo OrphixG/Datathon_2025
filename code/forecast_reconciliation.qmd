@@ -1,0 +1,144 @@
+---
+title: "Forecast Reconciliation for SCM"
+date: today
+format:
+  html:
+    theme: litera
+    embed-resources: true 
+    code-tools: true
+    toc: true
+    toc-location: right
+    number-sections: true
+    link-external-newwindow: true
+    link-external-icon: true
+    math: katex
+---
+
+# Libraries and Loading Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = F, warning = F, fig.align='center', fig.dim=c(10, 6))
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(viridis)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(janitor)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+data = read_csv("dynamic_supply_chain_logistics_dataset.csv") %>% 
+  rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude)
+```
+
+# Visualisations
+
+```{r}
+# Base map
+us = ne_states(country = "United States of America",
+                              returnclass = "sf")
+us_conus = subset(us, !name %in% c("Alaska","Hawaii","Puerto Rico")) |>
+  st_transform(4326)
+
+pts = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+# Clip points inside
+inside = lengths(st_within(pts, us_conus)) > 0
+pts_in = pts[inside, , drop = FALSE]
+
+# thin for legibility
+set.seed(1)
+pts_plot = if (nrow(pts_in) > 80000) pts_in[sample(nrow(pts_in), 80000), ] else pts_in
+
+us_outline = st_cast(us_conus, "MULTILINESTRING")
+
+# Plot delay probability
+color_var = "delay_probability"
+has_color = color_var %in% names(pts_plot)
+
+p = ggplot() +
+  geom_sf(data = us_conus, fill = "grey98", color = "grey90", linewidth = 0.2) +
+  { if (has_color)
+      geom_point(data = st_drop_geometry(pts_plot),
+                 aes(x = lon, y = lat, color = .data[[color_var]]),
+                 alpha = 0.35, size = 0.25)
+    else
+      geom_point(data = st_drop_geometry(pts_plot),
+                 aes(x = lon, y = lat),
+                 color = "steelblue", alpha = 0.35, size = 0.25)
+  } +
+  geom_sf(data = us_outline, fill = NA, color = "grey20", linewidth = 0.3) +
+  coord_sf(xlim = st_bbox(us_conus)[c("xmin","xmax")],
+           ylim = st_bbox(us_conus)[c("ymin","ymax")],
+           expand = FALSE, clip = "on") +
+  { if (has_color) scale_color_viridis_c(name = color_var, limits = c(0,1)) } +
+  labs(title = "Delay Probabilities: All States",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p)
+```
+
+## Southern California
+
+```{r}
+# California + SoCal bbox with border
+# Polygon
+ca = rnaturalearth::ne_states(country = "United States of America",
+                              returnclass = "sf") |>
+  subset(name == "California") |>
+  st_transform(4326)
+
+# points as sf 
+pts_all = st_as_sf(data, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+# only in CA
+pts_ca = st_intersection(pts_all, ca)
+
+# crop
+socal_bbox = c(xmin = -121, ymin = 32, xmax = -114, ymax = 36)  # note: st_bbox expects xmin,ymin,xmax,ymax
+bbox_poly = st_as_sfc(st_bbox(socal_bbox, crs = sf::st_crs(4326)))
+pts_socal = st_intersection(pts_ca, bbox_poly)
+
+cat("CA points:", nrow(pts_ca), " | SoCal-in-CA points:", nrow(pts_socal), "\n")
+
+# plot
+ca_outline = sf::st_cast(ca, "MULTILINESTRING")
+
+p_socal = ggplot() +
+  geom_sf(data = ca, fill = "grey98", color = "grey85", linewidth = 0.2) +
+  # bubble layer
+  geom_sf(
+    data = pts_socal,
+    aes(color = delay_probability, size = delay_probability),
+    alpha = 0.55
+  ) +
+  geom_sf(data = ca_outline, fill = NA, color = "grey20", linewidth = 0.4) +
+  coord_sf(xlim = c(socal_bbox["xmin"], socal_bbox["xmax"]),
+           ylim = c(socal_bbox["ymin"], c(socal_bbox["ymax"])),
+           expand = FALSE, clip = "on") +
+  scale_color_viridis_c(name = "delay_probability", limits = c(0, 1)) +
+  scale_size_continuous(range = c(2, 5), name = "delay_probability", guide = "none") +
+  labs(title = "Delay Probabilities: Southern California",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p_socal)
+```
+
+# Variables
+
+For reconciliation, we should use an **additive** target variable. Thus, we define a new target based on target D (Delivery Time Deviation) as **total delay time**, given as $$T=\sum \max\{D_i, 0\},\quad D_i=\text{delivery time deviation}.$$For this reason, we add the `delay_time` variable.
+
+```{r}
+data = data %>% mutate(delay_time = pmax(delivery_time_deviation, 0))
+```
+
