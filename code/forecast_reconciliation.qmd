@@ -34,6 +34,7 @@ library(rnaturalearth)
 library(rnaturalearthdata)
 library(ggridges)
 library(knitr)
+library(forecast)
 
 data = read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
   rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude) %>%
@@ -326,9 +327,117 @@ ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
 
 ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
   geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
-  scale_fill_viridis_d(guide = "none") +
   labs(title = "Distribution of delay time by cargo condition",
        x = "Delay time (hours)", y = NULL) +
   theme_bw()
 ```
 
+So really not much of a difference overall; this is not a very relevant feature at least.
+
+# ARIMA
+
+We try a simple ARIMA model as a baseline comparison.
+
+```{r}
+monthly = data %>%
+  filter(state == "California") %>%
+  mutate(Month = yearmonth(timestamp)) %>%
+  group_by(Month) %>%
+  summarise(y = sum(delay_time, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Month)
+
+# Make the month index complete and zero-fill any gaps
+monthly_full = monthly %>%
+  as_tsibble(index = Month) %>%
+  fill_gaps() %>%
+  mutate(y = coalesce(y, 0)) %>%
+  as_tibble()
+
+# Convert to base R ts (freq = 12) so it prints in the Jan..Dec matrix form
+start_y = year(as_date(min(monthly_full$Month)))
+start_m = month(as_date(min(monthly_full$Month)))
+y_ts = ts(monthly_full$y, start = c(start_y, start_m), frequency = 12)
+
+y_ts
+```
+
+ARIMA/SARIMA is appropriate here because the monthly delay-hours series is non-stationary (level shifts, uneven mean) and appears to have a seasonal pattern; ARIMA handles this by applying regular and seasonal differencing ($d$, $D$) before fitting AR/MA dynamics. Using `auto.arima` will automatically choose the needed differencing and seasonal terms, with residual checks confirming stationarity after differencing.
+
+## Fitting and Residuals
+
+```{r}
+# Split (to before 2024)
+freq = frequency(y_ts)
+ti   = time(y_ts)
+
+# indices by year
+idx_train = which(floor(ti) < 2024)    # 2021–2023
+idx_test  = which(floor(ti) == 2024)   # 2024 only
+
+# build contiguous ts objects
+y_train = ts(y_ts[idx_train], start = start(y_ts), frequency = freq)
+y_test  = ts(y_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+
+# quick sanity
+c(length_train = length(y_train), length_test = length(y_test))
+start(y_train); end(y_train)
+start(y_test);  end(y_test)
+
+fit = auto.arima(y_train , stepwise = FALSE, approximation = FALSE, stationary = FALSE)
+checkresiduals(fit)
+```
+
+## Interpretation
+
+We find that the algorithm classified ARIMA(0, 0, 0) meaning there really is no useful prediction method without incorporating other variables. For one final check we will try using the $x$-regressor as `cargo_condition_status`.
+
+# With $x$-regressor
+
+```{r}
+# build monthly target + raw regressor (mean cargo condition per month)
+monthly_x = data %>%
+  mutate(Month = yearmonth(timestamp),
+         ccs = as.numeric(cargo_condition_status)) %>%
+  group_by(Month) %>%
+  summarise(
+    y = sum(delay_time, na.rm = TRUE),         # target
+    ccs_mean = mean(ccs, na.rm = TRUE),        # raw regressor (0..1)
+    .groups = "drop"
+  ) %>%
+  arrange(Month) %>%
+  # make the month index complete; zero-fill y; fill any missing ccs_mean
+  as_tsibble(index = Month) %>%
+  fill_gaps() %>%
+  mutate(
+    y = coalesce(y, 0),
+    ccs_mean = tidyr::replace_na(ccs_mean, NA_real_)
+  ) %>%
+  as_tibble() %>%
+  fill(ccs_mean, .direction = "downup") %>%   # forward/back fill if needed
+  mutate(ccs_mean = coalesce(ccs_mean, mean(ccs_mean, na.rm = TRUE)))
+
+# convert to ts objects (freq = 12)
+start_y = year(as_date(min(monthly_x$Month)))
+start_m = month(as_date(min(monthly_x$Month)))
+y_ts = ts(monthly_x$y,        start = c(start_y, start_m), frequency = 12)
+x_ts = ts(monthly_x$ccs_mean, start = c(start_y, start_m), frequency = 12)
+
+# calendar split: train = 2021–2023, test = 2024
+ti = time(y_ts)
+freq = frequency(y_ts)
+idx_train = which(floor(ti) < 2024)
+idx_test  = which(floor(ti) == 2024)
+
+y_train = ts(y_ts[idx_train], start = start(y_ts), frequency = freq)
+x_train = ts(x_ts[idx_train], start = start(x_ts), frequency = freq)
+y_test  = ts(y_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+x_test  = ts(x_ts[idx_test],  start = c(2024, 1),  frequency = freq)
+
+# fit ARIMA with xreg (raw cargo condition)
+fit_x = auto.arima(y_train, xreg = x_train, stepwise = FALSE, approximation = FALSE)
+checkresiduals(fit_x)
+```
+
+Still ARIMA(0, 0, 0), so we can conclude that at this monthly aggregation, there’s no exploitable temporal structure and the raw cargo condition doesn’t add predictive power (as used). 
+
+In other words, at the monthly level, cargo condition has no statistically significant linear effect on delay-hours.
