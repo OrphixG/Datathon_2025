@@ -32,6 +32,8 @@ library(feasts)
 library(janitor)
 library(rnaturalearth)
 library(rnaturalearthdata)
+library(ggridges)
+library(knitr)
 
 data = read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
   rename(lon = vehicle_gps_longitude, lat = vehicle_gps_latitude) %>%
@@ -174,66 +176,158 @@ names(data)[names(data) == "name"] = "state"
 data = filter(data, !is.na(state))
 ```
 
+## EDA: Delay Time vs Cargo Condition Status
+
+```{r}
+data = data %>% mutate(cargo = 
+                         if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good"))
+ggplot(data, aes(x = cargo, y = delay_time, fill = cargo)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.65) +
+  labs(title = "Delay time by cargo condition",
+       x = NULL, y = "Delay time (hours)") +
+  theme_bw()
+
+ggplot(data, aes(x = delay_time, y = cargo, fill = cargo)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.1, rel_min_height = 0.001, color = "white") +
+  scale_fill_viridis_d(guide = "none") +
+  labs(title = "Distribution of delay time by cargo condition",
+       x = "Delay time (hours)", y = NULL) +
+  theme_bw()
+```
+
 # Forecast
 
 We first generate the *hierarchical* time series data associated with `data`. We group the data by months as well to get better totals; we tried hourly (default) and daily but don't get any good results.
 
 ```{r}
-data_ts = data %>% mutate(month = yearmonth(timestamp),
-                       cargo = if_else(cargo_condition_status <= 0.5, "Poor", "Good")) %>%
-  arrange(month, state, cargo, timestamp) %>%
-  distinct(month, state, cargo, .keep_all = TRUE)
+# Make month + cargo
+data = data %>%
+  mutate(
+    Month = yearmonth(timestamp),
+    cargo = if_else(as.numeric(cargo_condition_status) <= 0.5, "Poor", "Good")
+  ) %>%
+  filter(!is.na(state))
 
-ts = data_ts %>% as_tsibble(key = c(state, cargo), index = month) %>%
-  aggregate_key(state/cargo, delay_hours = sum(delay_hours))
+# One row per Month × state × cargo (sum within month)
+monthly = data %>%
+  group_by(Month, state, cargo) %>%
+  summarise(total_delay_hours = sum(delay_hours, na.rm = TRUE), .groups = "drop")
+
+# complete panel
+ts_m = monthly %>%
+  as_tsibble(index = Month, key = c(state, cargo)) %>%
+  fill_gaps(.full = TRUE) %>%
+  mutate(total_delay_hours = coalesce(total_delay_hours, 0)) %>%
+  aggregate_key(state / cargo, total_delay_hours = sum(total_delay_hours))
 ```
 
 ## Train-Test Split
 
 ```{r}
-n_test = 3  # last 3 months
-cutoff = max(ts$month, na.rm = TRUE) - n_test
-
-train_data = ts %>% filter(month <= cutoff)
-test_data  = ts %>% filter(month >  cutoff)
+# Split (last 12 months)
+n_test = 12
+cutoff = max(ts_m$Month, na.rm = TRUE) - n_test
+train_data = ts_m %>% filter(Month <= cutoff)
+test_data  = ts_m %>% filter(Month >  cutoff)
 ```
 
 When we try to fit an ETS model, we generally get NULL models for a lot of these entries, so we counteract this by doing the specified ETS model for the non-NULL models, and set the rest as a TSLM model.
 
 - ETS (additive) captures level/trend/season for non-negative flows and adapts well when there’s actual signal.
+
 - TSLM(~1) (intercept-only) is a safe fallback for all-zero or ultra-sparse series; it yields a valid (typically zero) forecast instead of a <NULL model>, keeping the hierarchy intact for reconciliation.
 
 ```{r}
-# Fallback if null
-fb = train_data %>% model(model = TSLM(delay_hours ~ 1))
+# Base fit
+fit = train_data %>% model(ETS = ETS(total_delay_hours ~ error("A") + season("A")))
 
-# main fitting
-fit = train_data %>% model(model = ETS(delay_hours ~ error("A")))
-is_null = is_null_model(fit$model)
-fit$model[is_null] = fb$model[is_null]
+# Replace NULLs in-place with TSLM(~1)
+fb  = train_data %>% model(ETS = TSLM(total_delay_hours ~ 1))
+
+idx = is_null_model(fit$ETS)
+fit$ETS[idx] = fb$ETS[idx]
 ```
 
 ## Reconciliation
 
 ```{r}
+# Reconcile & forecast
 recon_fc = fit %>%
-  reconcile(BU = bottom_up(model), 
-            OLS = min_trace(model, "ols"), 
-            WLS = min_trace(model, "wls_struct")) %>% 
+  reconcile(
+    BU  = bottom_up(ETS),
+    OLS = min_trace(ETS, "ols"),
+    WLS = min_trace(ETS, "wls_struct")
+  ) %>%
   forecast(h = n_test)
 ```
 
 ### Diagnostics
 
 ```{r}
-recon_tibble = recon_fc %>% as_tibble()
+rt = recon_fc %>%
+  as_tibble() %>%
+  filter(.model %in% c("BU","OLS","WLS"))
 
-first_month = recon_tibble %>% 
-  summarise(m1 = min(month)) %>% 
-  pull(m1)
+# TOTAL vs sum of STATES (each month)
+totals = rt %>% filter(is_aggregated(state), is_aggregated(cargo)) %>%
+  select(.model, Month, total = .mean)
 
-total_m1 = recon_tibble %>% 
-  filter(month == first_month, is_aggregated(state), is_aggregated(cargo)) %>%
-  select(.model, total = .mean)
+sum_states = rt %>% filter(!is_aggregated(state), is_aggregated(cargo)) %>%
+  group_by(.model, Month) %>%
+  summarise(sum_states = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+left_join(totals, sum_states, by = c(".model","Month")) %>%
+  mutate(diff = round(total - sum_states, 10)) %>%
+  group_by(.model) %>%
+  summarise(max_abs_diff = max(abs(diff), na.rm = TRUE), .groups = "drop")
+
+# For each state: parent vs sum of its cargo children
+parents = rt %>% filter(!is_aggregated(state), is_aggregated(cargo)) %>%
+  select(.model, Month, state, parent = .mean)
+
+children = rt %>% filter(!is_aggregated(state), !is_aggregated(cargo)) %>%
+  group_by(.model, Month, state) %>%
+  summarise(sum_children = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+left_join(parents, children, by = c(".model","Month","state")) %>%
+  mutate(diff = round(parent - sum_children, 10)) %>%
+  group_by(.model) %>%
+  summarise(max_abs_diff = max(abs(diff), na.rm = TRUE), .groups = "drop")
 ```
 
+# Comparison
+
+```{r}
+acc = accuracy(recon_fc, test_data)
+res = acc %>%
+  group_by(.model) %>%
+  summarise(MAE = mean(MAE, na.rm = TRUE),
+            RMSE = mean(RMSE, na.rm = TRUE)) %>%
+  arrange(RMSE)
+
+kable(res, align = "ccc")
+```
+
+Seems that OLS is the best performing model.
+
+## Plot
+
+```{r}
+# History: California state total (cargo aggregated)
+ca_hist = ts_m %>%
+  filter(state == "California", is_aggregated(cargo))
+
+# Reconciled forecasts: California state total (cargo aggregated)
+recon_ca = recon_fc %>%
+  filter(state == "California", is_aggregated(cargo))
+
+autoplot(recon_ca, level = NULL) +
+  autolayer(ca_hist, total_delay_hours, alpha = 0.3) +
+  labs(
+    title = "Reconciled forecasts by method – California (state total)",
+    y = "Total delay-hours (monthly)"
+  ) +
+  theme_bw()
+```
+
+Overall seems like even with reconciliation, we don't get a more accurate model. This could be attributed to the input variable not being very "significant" in difference.
