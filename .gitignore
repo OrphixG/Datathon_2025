@@ -1,4 +1,91 @@
+# R
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug information files
+*.dwo
+
+# Java/Python
+*.class
+*.py[cod]
+*.log
+*.jar
+*venv*/
+# Generated folders
+target/
+dist/
+build/
+node_modules/
+dist/
+coverage/
+
+# Local folders
+models/
+
+# Hidden folders
+.idea/
+.cache/
+.vscode/
+
+# System files
+TEST*.xml
+.DS_Store
+Thumbs.db
+
+# Executables
+*.app
+*.exe
+*.war
+
+# Audio files
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
+
+*.db
+*.pkl
+
