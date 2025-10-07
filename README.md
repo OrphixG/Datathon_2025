@@ -1,4 +1,4 @@
-# ⚠️ Datathon-2025
+# ⚠️ Datathon_2025
 
 Repository for SUDATA x SUBAA Datathon 2025.
 
